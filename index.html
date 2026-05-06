@@ -455,9 +455,17 @@ const SB_HEADERS  = {
 
 async function fetchLB() {
   try {
-    const res = await fetch(`${SB_ENDPOINT}?order=ts.asc`, { headers: SB_HEADERS });
+    const res = await fetch(`${SB_ENDPOINT}?order=ts.asc&limit=1000`, {
+      headers: {
+        ...SB_HEADERS,
+        "Range": "0-999",
+        "Range-Unit": "items"
+      }
+    });
     if (!res.ok) throw new Error(await res.text());
-    return await res.json();
+    const data = await res.json();
+    // Supabase kadang return object jika error, pastikan array
+    return Array.isArray(data) ? data : [];
   } catch (e) {
     console.warn('Supabase fetch error:', e);
     return [];
@@ -525,56 +533,49 @@ function aggregateByStudent(rows) {
     if (!map[key]) {
       map[key] = {
         nama:        r.nama,
-        paket_done:  new Set(),
-        total_benar: 0,
-        total_soal:  0,
-        total_poin:  0,
-        sum_waktu:   0,
-        cnt_waktu:   0,
-        first_ts:    r.ts   // waktu pertama kali mengerjakan
+        paket_done:  {},   // {paketKey: {benar, soal, poin, waktu}}
+        first_ts:    r.ts
       };
     }
     const s = map[key];
-    // hindari duplikat paket yang sama (ambil skor terbaik per paket)
-    const pk = `p${r.paket}`;
-    if (!s.paket_done.has(pk) || r.total_poin > (s[`poin_${pk}`] || 0)) {
-      if (s.paket_done.has(pk)) {
-        // kurangi dulu yang lama
-        s.total_benar -= s[`benar_${pk}`] || 0;
-        s.total_soal  -= s[`soal_${pk}`]  || 0;
-        s.total_poin  -= s[`poin_${pk}`]  || 0;
-        s.sum_waktu   -= s[`waktu_${pk}`] || 0;
-        s.cnt_waktu   -= 1;
-      }
-      s.paket_done.add(pk);
-      s[`benar_${pk}`] = r.benar;
-      s[`soal_${pk}`]  = r.total;
-      s[`poin_${pk}`]  = r.total_poin;
-      s[`waktu_${pk}`] = r.rata_waktu;
-      s.total_benar   += r.benar;
-      s.total_soal    += r.total;
-      s.total_poin    += r.total_poin;
-      s.sum_waktu     += r.rata_waktu;
-      s.cnt_waktu     += 1;
+    const pk = String(r.paket);
+    const prev = s.paket_done[pk];
+    // simpan skor terbaik per paket (bandingkan total_poin)
+    if (!prev || r.total_poin > prev.poin) {
+      s.paket_done[pk] = {
+        benar: r.benar,
+        soal:  r.total,
+        poin:  r.total_poin,
+        waktu: r.rata_waktu
+      };
     }
     if (r.ts < s.first_ts) s.first_ts = r.ts;
   }
 
-  return Object.values(map).map(s => ({
-    nama:        s.nama,
-    paket_selesai: s.paket_done.size,
-    total_benar: s.total_benar,
-    total_soal:  s.total_soal,
-    total_poin:  s.total_poin,
-    akurasi:     s.total_soal > 0 ? Math.round((s.total_benar / s.total_soal) * 100) : 0,
-    rata_waktu:  s.cnt_waktu > 0 ? Math.round((s.sum_waktu / s.cnt_waktu) * 10) / 10 : 0,
-    first_ts:    s.first_ts
-  }))
-  // urut: total_poin desc → akurasi desc → rata_waktu asc (makin cepat makin baik)
+  return Object.values(map).map(s => {
+    const entries = Object.values(s.paket_done);
+    const total_benar = entries.reduce((a, e) => a + (e.benar || 0), 0);
+    const total_soal  = entries.reduce((a, e) => a + (e.soal  || 0), 0);
+    const total_poin  = entries.reduce((a, e) => a + (e.poin  || 0), 0);
+    const sum_waktu   = entries.reduce((a, e) => a + (e.waktu || 0), 0);
+    const akurasi     = total_soal > 0 ? Math.round((total_benar / total_soal) * 100) : 0;
+    const rata_waktu  = entries.length > 0 ? Math.round((sum_waktu / entries.length) * 10) / 10 : 0;
+    return {
+      nama:           s.nama,
+      paket_selesai:  entries.length,
+      total_benar,
+      total_soal,
+      total_poin,
+      akurasi,
+      rata_waktu,
+      first_ts:       s.first_ts
+    };
+  })
+  // urut: total_poin desc → akurasi desc → rata_waktu asc
   .sort((a, b) =>
-    b.total_poin  - a.total_poin  ||
-    b.akurasi     - a.akurasi     ||
-    a.rata_waktu  - b.rata_waktu
+    b.total_poin - a.total_poin ||
+    b.akurasi    - a.akurasi    ||
+    a.rata_waktu - b.rata_waktu
   );
 }
 
@@ -697,6 +698,7 @@ function timeOut(paket,soalIdx){
   updateScore(paket);updateHistory();
   const next=soalIdx+1;
   if(next<BANK[paket].soal.length&&state.answers[paket][next]===undefined)startTimer(paket,next);
+  else if(next>=BANK[paket].soal.length){setTimeout(()=>submitPaketToLB(paket),600);}
 }
 
 // ── Answer ──
@@ -738,13 +740,22 @@ function answer(paket,soalIdx,key){
 }
 
 async function submitPaketToLB(paket){
-  const totalSoal=BANK[paket].soal.length;
-  const benar=state.scores[paket]||0;
-  const waktuArr=Object.values(state.waktuJawab[paket]||{});
-  const rataWaktu=waktuArr.length?waktuArr.reduce((a,b)=>a+b,0)/waktuArr.length:TIMER_SEC;
-  const totalPoin=state.poin&&state.poin[paket]?state.poin[paket]:0;
-  await addLBEntry(paket,benar,totalSoal,rataWaktu,totalPoin);
-  showToast(`✅ Skor ${namaSiswa||'Anonim'} tersimpan!`);
+  const totalSoal = BANK[paket].soal.length;
+  const benar     = state.scores[paket] || 0;
+  const totalPoin = (state.poin && state.poin[paket]) ? state.poin[paket] : 0;
+
+  // rata waktu: hitung semua soal (jawab + timeout), default TIMER_SEC jika belum tercatat
+  let sumWaktu = 0;
+  for (let i = 0; i < totalSoal; i++) {
+    const w = state.waktuJawab[paket] && state.waktuJawab[paket][i] != null
+      ? state.waktuJawab[paket][i]
+      : TIMER_SEC;
+    sumWaktu += w;
+  }
+  const rataWaktu = Math.round((sumWaktu / totalSoal) * 10) / 10;
+
+  await addLBEntry(paket, benar, totalSoal, rataWaktu, totalPoin);
+  showToast(`✅ Skor ${namaSiswa || 'Anonim'} tersimpan!`);
 }
 function updateScore(paket){
   const cnt=Object.values(state.answers[paket]).filter(v=>v!==undefined).length;
