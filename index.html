@@ -169,7 +169,7 @@
     <div class="lb-header">
       <div>
         <div class="lb-title">🏆 Papan Skor</div>
-        <div class="lb-subtitle">Diurutkan berdasarkan urutan masuk · Sinkron lintas device · Refresh otomatis tiap 15 detik</div>
+        <div class="lb-subtitle">Diurutkan: Total Poin ↓ → Akurasi ↓ → Kecepatan ↑ · Akumulasi semua paket per siswa · Refresh otomatis tiap 15 detik</div>
       </div>
       <button class="btn-clear-lb" onclick="clearLeaderboard()">🗑 Hapus Semua</button>
     </div>
@@ -179,12 +179,11 @@
           <tr>
             <th class="center">#</th>
             <th>Nama Siswa</th>
-            <th>Paket</th>
-            <th class="center">Benar</th>
-            <th class="center">Salah</th>
+            <th class="center">Paket Selesai</th>
+            <th class="center">Benar / Total</th>
+            <th class="center">Akurasi</th>
             <th class="right">Rata² Waktu</th>
             <th class="right">Total Poin</th>
-            <th class="right">Waktu Masuk</th>
           </tr>
         </thead>
         <tbody id="lbBody">
@@ -192,7 +191,7 @@
         </tbody>
       </table>
     </div>
-    <div class="score-formula">📐 Rumus poin: tiap jawaban benar = 10 + bonus kecepatan (maks. 5 poin). Timeout / salah = 0. · 🌐 Data tersimpan bersama — sinkron di semua device.</div>
+    <div class="score-formula">📐 Rumus poin per soal: Benar = 10 + bonus kecepatan (maks. 5). Salah / timeout = 0. Jika paket dikerjakan ulang, diambil skor terbaik. · 🌐 Sinkron lintas device via Supabase.</div>
   </div>
 
 </div>
@@ -482,11 +481,7 @@ async function persistLB(entry) {
 async function clearLeaderboard() {
   if (!confirm('Hapus semua data papan skor? (semua device akan terpengaruh)')) return;
   try {
-    // DELETE semua baris (neq filter diperlukan Supabase agar tidak error)
-    await fetch(`${SB_ENDPOINT}?id=neq.0`, {
-      method: "DELETE",
-      headers: SB_HEADERS
-    });
+    await fetch(`${SB_ENDPOINT}?id=neq.0`, { method: "DELETE", headers: SB_HEADERS });
   } catch (e) { console.warn(e); }
   renderLB([]);
   showToast('Papan skor dihapus');
@@ -522,26 +517,99 @@ function setLBLoading(on) {
   if (on) tbody.innerHTML = '<tr><td colspan="8" class="lb-empty" style="opacity:.5">⏳ Memuat data dari Supabase...</td></tr>';
 }
 
+// ── Agregasi semua paket per siswa ──
+function aggregateByStudent(rows) {
+  const map = {};
+  for (const r of rows) {
+    const key = r.nama.trim().toLowerCase();
+    if (!map[key]) {
+      map[key] = {
+        nama:        r.nama,
+        paket_done:  new Set(),
+        total_benar: 0,
+        total_soal:  0,
+        total_poin:  0,
+        sum_waktu:   0,
+        cnt_waktu:   0,
+        first_ts:    r.ts   // waktu pertama kali mengerjakan
+      };
+    }
+    const s = map[key];
+    // hindari duplikat paket yang sama (ambil skor terbaik per paket)
+    const pk = `p${r.paket}`;
+    if (!s.paket_done.has(pk) || r.total_poin > (s[`poin_${pk}`] || 0)) {
+      if (s.paket_done.has(pk)) {
+        // kurangi dulu yang lama
+        s.total_benar -= s[`benar_${pk}`] || 0;
+        s.total_soal  -= s[`soal_${pk}`]  || 0;
+        s.total_poin  -= s[`poin_${pk}`]  || 0;
+        s.sum_waktu   -= s[`waktu_${pk}`] || 0;
+        s.cnt_waktu   -= 1;
+      }
+      s.paket_done.add(pk);
+      s[`benar_${pk}`] = r.benar;
+      s[`soal_${pk}`]  = r.total;
+      s[`poin_${pk}`]  = r.total_poin;
+      s[`waktu_${pk}`] = r.rata_waktu;
+      s.total_benar   += r.benar;
+      s.total_soal    += r.total;
+      s.total_poin    += r.total_poin;
+      s.sum_waktu     += r.rata_waktu;
+      s.cnt_waktu     += 1;
+    }
+    if (r.ts < s.first_ts) s.first_ts = r.ts;
+  }
+
+  return Object.values(map).map(s => ({
+    nama:        s.nama,
+    paket_selesai: s.paket_done.size,
+    total_benar: s.total_benar,
+    total_soal:  s.total_soal,
+    total_poin:  s.total_poin,
+    akurasi:     s.total_soal > 0 ? Math.round((s.total_benar / s.total_soal) * 100) : 0,
+    rata_waktu:  s.cnt_waktu > 0 ? Math.round((s.sum_waktu / s.cnt_waktu) * 10) / 10 : 0,
+    first_ts:    s.first_ts
+  }))
+  // urut: total_poin desc → akurasi desc → rata_waktu asc (makin cepat makin baik)
+  .sort((a, b) =>
+    b.total_poin  - a.total_poin  ||
+    b.akurasi     - a.akurasi     ||
+    a.rata_waktu  - b.rata_waktu
+  );
+}
+
 function renderLB(data) {
   const tbody = document.getElementById('lbBody');
   if (!data || !data.length) {
     tbody.innerHTML = '<tr><td colspan="8" class="lb-empty">Belum ada data. Selesaikan paket soal untuk muncul di sini.</td></tr>';
     return;
   }
-  const sorted = [...data].sort((a, b) => a.ts - b.ts);
-  tbody.innerHTML = sorted.map((d, i) => {
-    const perfect = d.benar === d.total && d.salah === 0;
-    const badge   = perfect ? '<span class="lb-badge perfect">Sempurna</span>' : '';
-    const waktuStr = new Date(d.ts).toLocaleString('id-ID', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+
+  const students = aggregateByStudent(data);
+
+  const rankIcon = i => {
+    if (i === 0) return '<span class="lb-rank gold">🥇</span>';
+    if (i === 1) return '<span class="lb-rank silver">🥈</span>';
+    if (i === 2) return '<span class="lb-rank bronze">🥉</span>';
+    return `<span class="lb-rank other">${i + 1}</span>`;
+  };
+
+  const akurasiBadge = pct => {
+    if (pct === 100) return '<span class="lb-badge perfect">100%</span>';
+    const color = pct >= 80 ? '#6ee7a0' : pct >= 60 ? '#c9a84c' : '#e07070';
+    return `<span style="font-size:12px;font-weight:600;color:${color}">${pct}%</span>`;
+  };
+
+  tbody.innerHTML = students.map((s, i) => {
+    const ptsClass = i < 3 ? 'lb-pts top' : 'lb-pts';
     return `<tr>
-      <td class="center"><span class="lb-rank other">${i + 1}</span></td>
-      <td><span class="lb-nama">${d.nama}</span>${badge}</td>
-      <td><span class="lb-paket">P${d.paket} · ${d.pilar}</span></td>
-      <td class="center"><span class="lb-score-chip">${d.benar}/${d.total}</span></td>
-      <td class="center" style="color:rgba(253,246,236,.5)">${d.salah}</td>
-      <td class="right"><span class="lb-time">${d.rata_waktu}s</span></td>
-      <td class="right"><span class="lb-pts">${d.total_poin}</span></td>
-      <td class="right" style="font-size:11px;color:rgba(253,246,236,.35);">${waktuStr}</td>
+      <td class="center">${rankIcon(i)}</td>
+      <td><span class="lb-nama">${s.nama}</span></td>
+      <td class="center" style="color:rgba(253,246,236,.6);font-size:13px;">${s.paket_selesai}<span style="color:rgba(253,246,236,.3);font-size:11px;">/10</span></td>
+      <td class="center"><span class="lb-score-chip">${s.total_benar}/${s.total_soal}</span></td>
+      <td class="center">${akurasiBadge(s.akurasi)}</td>
+      <td class="right"><span class="lb-time">${s.rata_waktu}s</span></td>
+      <td class="right"><span class="${ptsClass}">${s.total_poin}</span></td>
     </tr>`;
   }).join('');
 }
